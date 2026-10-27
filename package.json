@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && cp src/schema.sql dist/schema.sql",
-    "test": "node --test test/*.test.mjs"
+    "test": "ENTRYLITE_WORLD_URL=${ENTRYLITE_WORLD_URL:-postgres://world:world@127.0.0.1:5432/workflow} node --test test/*.test.mjs"
   },
   "dependencies": {
     "@workflow/errors": "5.0.5",

@@ -62,6 +62,12 @@ export function createWorld(config: {
   // 90s gets a fresh run-level wake (idempotent; the runtime dedups by event log).
   const sweepLostWakes = async () => {
     try {
+      // Cross-instance serialization: two deployments sweeping + claiming the
+      // same rows can deadlock (NOT EXISTS probes vs claim UPDATEs); an
+      // advisory lock makes the sweep single-flighter per database.
+      const locked = await pool.query(`SELECT pg_try_advisory_lock(918273645) AS ok`);
+      if (!locked.rows[0]?.ok) return;
+      try {
       const stale = await pool.query(
         `SELECT r.run_id, r.workflow_name FROM entrylite.workflow_runs r
          WHERE r.status='running'
@@ -82,6 +88,9 @@ export function createWorld(config: {
           [nsQueueName(`__wkf_workflow_${r0.workflow_name}`), r0.run_id, nsQueueName(`lostwake_${r0.run_id}_${Math.floor(Date.now() / 90000)}`)],
         ).catch((e: any) => { if (e?.code !== '23505') throw e; });
         if (process.env.ENTRYLITE_DEBUG) console.log('[entrylite-world] lost-wake backstop fired for', r0.run_id);
+      }
+      } finally {
+        await pool.query(`SELECT pg_advisory_unlock(918273645)`).catch(() => {});
       }
     } catch (e: any) {
       console.error('[entrylite-world] lost-wake sweep:', String(e).slice(0, 200));
