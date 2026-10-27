@@ -7,8 +7,8 @@
     "start": "node server.js"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Miracle <miraclethirdbase1@gmail.com> (https://github.com/thirdbase1)",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "devalue": "^5.0.0",

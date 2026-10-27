@@ -2,6 +2,11 @@
   "name": "@entrylite/world",
   "version": "1.0.0",
   "description": "Entry-Lite production World for the Vercel Workflow SDK — plain node-postgres, no drizzle/graphile. Entry-Lite's own durable backend.",
+  "license": "MIT",
+  "author": "Miracle <miraclethirdbase1@gmail.com> (https://github.com/thirdbase1)",
+  "contributors": [
+    "Miracle <miraclethirdbase1@gmail.com> (https://github.com/thirdbase1)"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

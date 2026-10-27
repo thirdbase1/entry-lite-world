@@ -85,6 +85,14 @@ Protocol contracts (spec 8): in-band writer fence (`expectedSeqInBand` / `InBand
 
 Verified: durability (SIGKILL resume), depth (150 steps), throughput (5k runs, no namespace regression), multi-process scale, namespace isolation, crash recovery, hook resume (dedup + force-claim), invoke end-to-end. Remaining caveats: benchmarks are synthetic, not real-traffic proof; OTel export is app-side (the SDK emits spans when the app registers an OTel SDK — no world endpoint required).
 
+## Contributing
+
+Maintainer: **Miracle** — miraclethirdbase1@gmail.com ([@thirdbase1](https://github.com/thirdbase1)).
+
+Open an issue or send a PR against `main`. Run `npm run build` and the per-file suites in `test/` before submitting.
+
 ## License
 
-MIT
+Released under the [MIT License](./LICENSE) — © 2026 Miracle (miraclethirdbase1@gmail.com).
+
+This is the standard, unmodified MIT license text (SPDX identifier `MIT`).
