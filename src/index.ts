@@ -72,12 +72,15 @@ export function createWorld(config: {
         [nsQueueName('__wkf_workflow_')],
       );
       for (const r0 of stale.rows) {
+        // 23505 (duplicate job_key) is the expected dedup outcome when the
+        // earlier wake row exists but is currently locked — the partial
+        // conflict target doesn't cover locked rows, so swallow it.
         await pool.query(
           `INSERT INTO entrylite.workflow_jobs (queue_name, payload, run_at, job_key)
            VALUES ($1, jsonb_build_object('runId', $2::text, 'requestedAt', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')), now(), $3)
            ON CONFLICT (job_key) WHERE locked_at IS NULL DO NOTHING`,
           [nsQueueName(`__wkf_workflow_${r0.workflow_name}`), r0.run_id, nsQueueName(`lostwake_${r0.run_id}_${Math.floor(Date.now() / 90000)}`)],
-        );
+        ).catch((e: any) => { if (e?.code !== '23505') throw e; });
         if (process.env.ENTRYLITE_DEBUG) console.log('[entrylite-world] lost-wake backstop fired for', r0.run_id);
       }
     } catch (e: any) {
