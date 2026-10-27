@@ -8,6 +8,7 @@ import type { Pool } from 'pg';
 import { ulid } from 'ulid';
 import { z } from 'zod';
 import { newChunkId, newMessageId, parseQueueName, serializeBody, deserializeBody, NAMESPACE, NS_SEP, nsQueueName, isOwnQueueName, NS_CLAIM_WHERE, nsJobKey } from './util.js';
+import { trace, injectTraceContextIntoHeaders } from './telemetry.js';
 
 const WORKER_ID = `elw_${ulid()}`;
 
@@ -20,11 +21,26 @@ export function createQueue(pool: Pool) {
 
   const QUEUE_POLL_MS = parseInt(process.env.ENTRYLITE_QUEUE_POLL_MS ?? '250', 10);
   const CONCURRENCY = parseInt(process.env.ENTRYLITE_QUEUE_CONCURRENCY ?? '50', 10);
+  // Lease timeout: a job locked longer than this is considered abandoned by a
+  // crashed worker and becomes stealable by any claimer (attempt incremented).
+  const LEASE_TIMEOUT_MS = parseInt(process.env.ENTRYLITE_LEASE_TIMEOUT_MS ?? '90000', 10);
 
   const BASE_URL = process.env.WORKFLOW_LOCAL_BASE_URL
     ?? (process.env.PORT ? `http://localhost:${process.env.PORT}` : 'http://localhost:3000');
 
+  const extractRunId = (queueName: string, payload: any): string | undefined => {
+    if (payload && typeof payload.runId === 'string') return payload.runId;
+    // Run-topic wake jobs carry the runId in their body; fall back to the queue name.
+    return queueName.includes('::') ? undefined : undefined;
+  };
+
   async function deliver(job: { id: number; queue_name: string; payload: any; attempts: number }) {
+    return trace('entrylite.queue.deliver', {
+      'entrylite.queue.name': job.queue_name,
+      'entrylite.queue.attempts': job.attempts,
+      'entrylite.run.id': extractRunId(job.queue_name, job.payload),
+      'entrylite.namespace': NAMESPACE,
+    }, async () => {
     // Stable per-job message id: derive from the job's identity (id + attempts)
     // rather than minting a fresh id per delivery attempt — the SDK uses
     // messageId for dedup/delivery bookkeeping and expects it stable.
@@ -35,6 +51,9 @@ export function createQueue(pool: Pool) {
       'x-vqs-message-id': messageId,
       'x-vqs-message-attempt': String(job.attempts),
     };
+    // Propagate the active W3C trace context (traceparent) so app-side spans
+    // parent correctly off this delivery (mirrors world-vercel).
+    await injectTraceContextIntoHeaders(headers);
     // TypedJSON body: restore Uint8Array markers lost in jsonb storage via reviver.
     const body = Buffer.from(JSON.stringify(job.payload));
     if (process.env.ENTRYLITE_DEBUG) console.log('[entrylite-world] body:', body.toString().slice(0, 200));
@@ -94,14 +113,22 @@ export function createQueue(pool: Pool) {
       await pool.query(`DELETE FROM entrylite.workflow_jobs WHERE id=$1`, [job.id]);
       return;
     }
+    // Non-transport delivery failure path: retry with backoff until the max
+    // attempts budget is exhausted, then dead-letter the job (instead of
+    // parking it forever in 1h increments).
+    const MAX_ATTEMPTS = parseInt(process.env.ENTRYLITE_MAX_ATTEMPTS ?? '48', 10);
     const attempts = job.attempts;
     const backoff = Math.min(5000 * attempts, 60000);
-    if (attempts >= 48) {
+    if (attempts >= MAX_ATTEMPTS) {
+      // Dead-letter: move the exhausted job out of the active queue. Identity
+      // (job id) is preserved so requeue can be traced back to the original.
       await pool.query(
-        `UPDATE entrylite.workflow_jobs SET locked_at=NULL, locked_by=NULL, last_error=$2,
-           run_at = now() + interval '1 hour' WHERE id=$1`,
-        [job.id, text.slice(0, 2000)],
+        `INSERT INTO entrylite.workflow_dead_letter (job_id, queue_name, payload, attempts, last_error)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (job_id) DO UPDATE SET attempts=$4, last_error=$5, parked_at=now()`,
+        [job.id, job.queue_name, job.payload, attempts, text.slice(0, 2000)],
       );
+      await pool.query(`DELETE FROM entrylite.workflow_jobs WHERE id=$1`, [job.id]);
       return;
     }
     await pool.query(
@@ -109,15 +136,22 @@ export function createQueue(pool: Pool) {
          run_at = now() + ($3 || ' milliseconds')::interval WHERE id=$1`,
       [job.id, text.slice(0, 2000), String(backoff)],
     );
+    });
   }
 
   async function pickAndRun(): Promise<void> {
     if (closing) return;
     while (!closing && inFlight.size < CONCURRENCY) {
+      await trace('entrylite.queue.claim', {
+        'entrylite.namespace': NAMESPACE,
+      }, async () => {
+      // Claim query: pick up unlocked due jobs AND steal jobs whose lease has
+      // expired (locked_at older than LEASE_TIMEOUT — the worker crashed while
+      // holding them). Stealing increments attempts, preserving job identity.
       const claimWhere = NAMESPACE
-        ? `WHERE run_at <= now() AND locked_at IS NULL AND queue_name LIKE $2`
-        : `WHERE run_at <= now() AND locked_at IS NULL AND queue_name NOT LIKE '%::%'`;
-      const claimArgs: unknown[] = NAMESPACE ? [WORKER_ID, `${NAMESPACE}${NS_SEP}%`] : [WORKER_ID];
+        ? `WHERE run_at <= now() AND (locked_at IS NULL OR locked_at < now() - ($3 || ' milliseconds')::interval) AND queue_name LIKE $2`
+        : `WHERE run_at <= now() AND (locked_at IS NULL OR locked_at < now() - ($2 || ' milliseconds')::interval) AND queue_name NOT LIKE '%::%'`;
+      const claimArgs: unknown[] = NAMESPACE ? [WORKER_ID, `${NAMESPACE}${NS_SEP}%`, String(LEASE_TIMEOUT_MS)] : [WORKER_ID, String(LEASE_TIMEOUT_MS)];
       const r = await pool.query(
         `UPDATE entrylite.workflow_jobs SET locked_at=now(), locked_by=$1, attempts=attempts+1
          WHERE id = (
@@ -129,11 +163,14 @@ export function createQueue(pool: Pool) {
         claimArgs,
       );
       if (!r.rows[0]) return;
-      const p = deliver(r.rows[0]).catch((err) => {
+      const job = r.rows[0] as { id: number; queue_name: string; payload: any; attempts: number };
+      const p = deliver(job).catch((err) => {
         console.error('[entrylite-world] delivery crashed:', err);
       });
       inFlight.add(p);
       void p.finally(() => inFlight.delete(p));
+      return;
+      });
     }
   }
 
@@ -172,6 +209,11 @@ export function createQueue(pool: Pool) {
     // worker-liveness backstop when the interval died after HMR dispose).
     kick: (): void => { void pickAndRun(); },
     async queue(queueName: string, message: unknown, opts?: any): Promise<{ messageId: string | null }> {
+      return trace('entrylite.queue.enqueue', {
+        'entrylite.queue.name': queueName,
+        'entrylite.run.id': (message as any)?.runId,
+        'entrylite.namespace': NAMESPACE,
+      }, async () => {
       const { prefix, id } = parseQueueName(queueName);
       const messageId = newMessageId();
       // TypedJSON round-trip: Uint8Array → {__type:'Uint8Array',data:base64} so jsonb storage
@@ -194,6 +236,7 @@ export function createQueue(pool: Pool) {
       );
       void pickAndRun();
       return { messageId };
+      });
     },
     createQueueHandler(queueNamePrefix: string, handler: (message: unknown, meta: any) => Promise<void | { timeoutSeconds: number }>) {
       // The runtime serves this fn at its flow route. For HTTP deliveries we
@@ -237,6 +280,57 @@ export function createQueue(pool: Pool) {
     },
     getDeploymentId(): Promise<string> {
       return Promise.resolve(NAMESPACE ? `entrylite-${NAMESPACE}` : 'entrylite');
+    },
+    // Dead-letter management: list parked jobs and requeue (or delete) them.
+    async deadLetterList(options?: { limit?: number; queueName?: string }): Promise<any> {
+      const limit = Math.min(options?.limit ?? 100, 1000);
+      const r = await pool.query(
+        `SELECT job_id AS "jobId", queue_name AS "queueName", payload, attempts, last_error AS "lastError", parked_at AS "parkedAt"
+         FROM entrylite.workflow_dead_letter
+         WHERE ($2::varchar IS NULL OR queue_name = $2)
+         ORDER BY parked_at DESC LIMIT $1`,
+        [limit, options?.queueName ?? null],
+      );
+      return { data: r.rows, hasMore: r.rows.length > limit };
+    },
+    async deadLetterRequeue(jobId: number | string): Promise<{ requeued: boolean }> {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // Re-read the parked row FOR UPDATE and re-insert the job preserving
+        // its identity (id), payload, queue and a fresh attempt budget.
+        const parked = await client.query(
+          `SELECT job_id, queue_name, payload, attempts FROM entrylite.workflow_dead_letter WHERE job_id=$1 FOR UPDATE`,
+          [jobId],
+        );
+        const row = parked.rows[0];
+        if (!row) {
+          await client.query('ROLLBACK');
+          return { requeued: false };
+        }
+        await client.query(
+          `INSERT INTO entrylite.workflow_jobs (id, queue_name, payload, run_at, attempts)
+           OVERRIDING SYSTEM VALUE VALUES ($1,$2,$3,now(),0)
+           ON CONFLICT (id) DO UPDATE SET locked_at=NULL, locked_by=NULL, last_error=NULL, run_at=now(), attempts=0`,
+          [row.job_id, row.queue_name, row.payload],
+        );
+        await client.query(
+          `SELECT setval(pg_get_serial_sequence('entrylite.workflow_jobs','id'), GREATEST((SELECT max(id) FROM entrylite.workflow_jobs), 1), true)`,
+        );
+        await client.query(`DELETE FROM entrylite.workflow_dead_letter WHERE job_id=$1`, [jobId]);
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+      void pickAndRun();
+      return { requeued: true };
+    },
+    async deadLetterDelete(jobId: number | string): Promise<{ deleted: boolean }> {
+      const r = await pool.query(`DELETE FROM entrylite.workflow_dead_letter WHERE job_id=$1`, [jobId]);
+      return { deleted: (r.rowCount ?? 0) > 0 };
     },
     async start(): Promise<void> {
       await startWakeListener();

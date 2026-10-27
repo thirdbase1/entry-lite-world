@@ -8,6 +8,7 @@ import type { Pool, PoolClient } from 'pg';
 import {
   EntityConflictError,
   HookNotFoundError,
+  InBandSupersededError,
   RunExpiredError,
   TooEarlyError,
   WorkflowRunNotFoundError,
@@ -146,6 +147,7 @@ export async function createEvent(
   runId: string | null,
   data: any,
   wakes: Array<{ queueName: string; body: unknown; delaySeconds?: number; jobKey?: string }> = [],
+  params?: { inBand?: boolean; expectedSeqInBand?: number; eventCount?: number },
 ): Promise<EventResultLike> {
   const isRunCreated = data.eventType === 'run_created';
   let effectiveRunId: string;
@@ -161,8 +163,32 @@ export async function createEvent(
 
   return withTx(pool, async (tx) => {
     let run: any, step: any, hook: any, wait: any;
+    let overrideEventType: string | null = null;
+    let overrideEventData: any = null;
     let eventId: string;
     const eventData = ('eventData' in data ? data.eventData : undefined) as Json | undefined;
+
+    // ---------- in-band writer fence (capabilities.inBandFence) ----------
+    // A fenced in-band create must carry its expected count; the World checks
+    // it against seqInBand (read under the slot row lock, before anything is
+    // written) and refuses on mismatch with InBandSupersededError carrying
+    // both counters. Out-of-band writes are never refused and never move the
+    // count. run_created counts as the run's first in-band position.
+    if (params?.inBand && !isRunCreated) {
+      if (typeof params.expectedSeqInBand !== 'number') {
+        throw Object.assign(new WorkflowWorldError('in-band create without expectedSeqInBand'), { statusCode: 400 });
+      }
+      await tx.query(`INSERT INTO entrylite.workflow_event_slots (run_id) VALUES ($1) ON CONFLICT DO NOTHING`, [effectiveRunId]);
+      const slot = await tx.query(`SELECT seq_in_band FROM entrylite.workflow_event_slots WHERE run_id = $1 FOR UPDATE`, [effectiveRunId]);
+      const seqInBand = Number(slot.rows[0]?.seq_in_band ?? 0);
+      if (params.expectedSeqInBand !== seqInBand) {
+        throw new InBandSupersededError(
+          `In-band write superseded: expected seqInBand ${params.expectedSeqInBand}, world holds ${seqInBand}`,
+          { seqInBand },
+        );
+      }
+      await tx.query(`UPDATE entrylite.workflow_event_slots SET seq_in_band = seq_in_band + 1 WHERE run_id = $1`, [effectiveRunId]);
+    }
 
     // ---------- validation ----------
     let currentRun: any = null;
@@ -469,8 +495,7 @@ export async function createEvent(
           `INSERT INTO entrylite.workflow_hooks
              (run_id, hook_id, token, metadata, spec_version, is_webhook, is_system, token_retention_until)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-           ON CONFLICT (hook_id) DO NOTHING RETURNING *`,
-          [
+           ON CONFLICT (hook_id) DO NOTHING RETURNING *`, [
             effectiveRunId,
             data.correlationId,
             eventData.token,
@@ -481,14 +506,64 @@ export async function createEvent(
             eventData.tokenRetentionUntil ? new Date(eventData.tokenRetentionUntil).toISOString() : null,
           ],
         );
+        let exTok: any = null;
         if (ins.rows[0]) {
-          hook = mapHook(ins.rows[0]);
-        } else {
-          const ex = await tx.query(`SELECT * FROM entrylite.workflow_hooks WHERE hook_id=$1`, [data.correlationId]);
+          // Token conflict: same custom token already held by ANOTHER active
+          // run (HookConflictError contract). Route to the force/conflict path.
+          const tok = await tx.query(
+            `SELECT * FROM entrylite.workflow_hooks
+             WHERE token=$1 AND hook_id<>$2 AND run_id<>$3 LIMIT 1`,
+            [eventData.token, data.correlationId, effectiveRunId],
+          );
+          if (tok.rows[0]) {
+            exTok = tok;
+            ins.rows.length = 0; // treat as conflicting below
+          } else {
+            hook = mapHook(ins.rows[0]);
+          }
+        }
+        if (!hook) {
+          const ex = exTok ?? await tx.query(`SELECT * FROM entrylite.workflow_hooks WHERE hook_id=$1`, [data.correlationId]);
           if (ex.rows[0] && ex.rows[0].run_id !== effectiveRunId) {
             // Force claim: the caller takes the token from the victim run,
             // re-pointing the hook row and recording who it was taken from.
             if (eventData.force) {
+              // Refuse force against a running victim stamped below spec 8
+              // (can't read forceClaimedBy → would strand silently): the
+              // forced creation answers with an ordinary hook_conflict and the
+              // victim's log gets a hook_conflict event with the reason.
+              const victimRun = await tx.query(`SELECT status, spec_version FROM entrylite.workflow_runs WHERE run_id=$1`, [ex.rows[0].run_id]);
+              const vRow = victimRun.rows[0] ?? {};
+              const vSpec = Number(vRow.spec_version ?? 0);
+              const victimFinished = ['completed', 'failed', 'cancelled'].includes(vRow.status);
+              if (!victimFinished && vSpec < 8) {
+                eventId = await allocateEventId(tx, effectiveRunId);
+                overrideEventType = 'hook_conflict';
+                overrideEventData = {
+                    token: ex.rows[0].token,
+                    conflictingRunId: ex.rows[0].run_id,
+                    forceRefusedReason: 'victim-spec-version',
+                };
+                await insertEvent(tx, effectiveRunId, eventId, {
+                  ...data,
+                  eventType: 'hook_conflict',
+                  eventData: overrideEventData,
+                }, specVersion);
+                break;
+              }
+              // Victim journaling: the losing run's event log gets a
+              // hook_disposed naming who took the token (contract for
+              // HookForceClaimedError surfacing in the victim runtime).
+              const disposedId = await allocateEventId(tx, ex.rows[0].run_id);
+              await insertEvent(tx, ex.rows[0].run_id, disposedId, {
+                eventType: 'hook_disposed',
+                correlationId: data.correlationId,
+                eventData: {
+                  token: ex.rows[0].token,
+                  forceClaimedBy: { runId: effectiveRunId, hookId: data.correlationId },
+                },
+                specVersion: ex.rows[0].spec_version ?? specVersion,
+              }, ex.rows[0].spec_version ?? specVersion);
               const upd = await tx.query(
                 `UPDATE entrylite.workflow_hooks
                  SET run_id=$1, metadata=$2, token_retention_until=$3
@@ -611,14 +686,27 @@ export async function createEvent(
       );
     }
 
+    // run_created counts as the run's first in-band position (never fenced itself).
+    if (isRunCreated) {
+      await tx.query(
+        `INSERT INTO entrylite.workflow_event_slots (run_id, seq_in_band) VALUES ($1, 1)
+         ON CONFLICT (run_id) DO UPDATE SET seq_in_band = entrylite.workflow_event_slots.seq_in_band + 1`,
+        [effectiveRunId],
+      );
+    }
+
+    // The returned event reflects what the World actually committed: a refused
+    // force answers with the hook_conflict event that was written, not the
+    // caller's original hook_created.
+    const committedData = overrideEventData ? { ...data, eventType: overrideEventType!, eventData: overrideEventData } : data;
     const event = compact({
-      ...data,
+      ...committedData,
       runId: effectiveRunId,
       eventId,
       createdAt: now,
       specVersion: specVersion,
     });
-    return { event, run, step, hook, wait };
+    return { event, run, step, hook, wait, allocated: 1 };
   });
 }
 

@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS entrylite.workflow_dynamic_code (
 );
 
 CREATE TABLE IF NOT EXISTS entrylite.workflow_event_slots (
-  run_id varchar PRIMARY KEY
+  run_id varchar PRIMARY KEY,
+  seq_in_band bigint NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS entrylite.workflow_steps (
@@ -156,6 +157,17 @@ CREATE INDEX IF NOT EXISTS idx_el_jobs_ns_due ON entrylite.workflow_jobs (queue_
 CREATE INDEX IF NOT EXISTS idx_el_jobs_locker ON entrylite.workflow_jobs (locked_by)
   WHERE locked_by IS NOT NULL;
 
+-- Dead-letter queue: jobs that exhausted their attempt budget are parked here
+-- (with identity, payload and last error) instead of being retried forever.
+CREATE TABLE IF NOT EXISTS entrylite.workflow_dead_letter (
+  job_id     bigint PRIMARY KEY,
+  queue_name varchar NOT NULL,
+  payload    jsonb NOT NULL,
+  attempts   integer NOT NULL,
+  last_error text,
+  parked_at  timestamptz NOT NULL DEFAULT now()
+);
+
 -- Stream chunks
 CREATE TABLE IF NOT EXISTS entrylite.workflow_stream_chunks (
   stream_id  varchar NOT NULL,
@@ -186,3 +198,4 @@ FOR EACH STATEMENT EXECUTE FUNCTION entrylite.notify_job();
 -- Migrations for existing deployments (idempotent)
 ALTER TABLE entrylite.workflow_runs ADD COLUMN IF NOT EXISTS dynamic_workflow_code jsonb;
 ALTER TABLE entrylite.workflow_runs ADD COLUMN IF NOT EXISTS dynamic_workflow_code_ref varchar;
+ALTER TABLE entrylite.workflow_event_slots ADD COLUMN IF NOT EXISTS seq_in_band bigint NOT NULL DEFAULT 0;

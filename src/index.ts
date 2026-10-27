@@ -8,6 +8,7 @@ import { createRunsStorage, createStepsStorage, createHooksStorage, createEvents
 import { createQueue, createStreamer } from './queue.js';
 import { createExtras } from './extras.js';
 import { newRunId, NAMESPACE, nsQueueName, nsJobKey, NS_CLAIM_WHERE } from './util.js';
+import { trace } from './telemetry.js';
 
 export function createWorld(config: {
   connectionString?: string;
@@ -147,6 +148,12 @@ export function createWorld(config: {
       // invoke() hook-resume fast path: delivery captures the flow handler's
       // response as the invocation outcome (see queue.ts deliver).
       invoke: true,
+      // events.create fences in-band writers via workflow_event_slots.seq_in_band
+      // (row-locked counter; InBandSupersededError on mismatch) and events.list
+      // returns a {seq, seqInBand} snapshot.
+      inBandFence: true,
+      // events.list honors resolveData: 'skip-step-inputs' on the returned page.
+      eventsResolveData: true,
     },
     runs: { ...runs, ...extrasWorld._runsAdditions },
     steps,
@@ -155,6 +162,11 @@ export function createWorld(config: {
       ...eventsRead,
       ...extrasWorld._eventsAdditions,
       async create(runId: string | null, data: any, params?: any): Promise<any> {
+        return trace('entrylite.events.create', {
+          'entrylite.run.id': runId ?? undefined,
+          'entrylite.event.type': data?.eventType,
+          'entrylite.namespace': NAMESPACE,
+        }, async (span) => {
         if (params?.resumeId) data = { ...data, resumeId: params.resumeId };
         // Derive wake messages from the event type — the queue coordinates the
         // runtime uses. flow trigger wakes go to the workflow name queue;
@@ -166,8 +178,10 @@ export function createWorld(config: {
             body: await (async () => { const rr = await pool.query('SELECT * FROM entrylite.workflow_runs WHERE run_id = $1', [runId]); const row = rr.rows[0] ?? {}; return { runId, requestedAt: new Date().toISOString(), traceCarrier: {}, input: row.input ?? undefined, deploymentId: row.deployment_id, workflowName: row.workflow_name, executionContext: row.execution_context ?? undefined, attributes: row.attributes ?? {}, specVersion: row.spec_version ?? 8, waitContinuation: { attempt: 0, correlationId: data.correlationId } }; })(),
           });
         }
-        const result = await createEvent(pool, runId, data, wakes);
+        const result = await createEvent(pool, runId, data, wakes, params);
+        span?.setAttribute('entrylite.run.id', result?.run?.runId ?? runId ?? '');
         return result;
+        });
       },
       get: eventsRead.get,
       list: eventsRead.list,

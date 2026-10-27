@@ -224,6 +224,14 @@ export function createEventsReadStorage(pool: Pool) {
       const cursor = params?.pagination?.cursor;
       const order = params?.pagination?.sortOrder ?? 'asc';
       const cmp = order === 'asc' ? '>' : '<';
+      // In-band fence counters are read BEFORE the listing so a full load
+      // covers every position up to this snapshot (capabilities.inBandFence).
+      const snap = await pool.query(
+        `SELECT sl.seq_in_band,
+                (SELECT COUNT(*) FROM entrylite.workflow_events e WHERE e.run_id = $1) AS seq
+           FROM entrylite.workflow_event_slots sl WHERE sl.run_id = $1`,
+        [params.runId],
+      );
       const q = await pool.query(
         `SELECT * FROM entrylite.workflow_events
          WHERE run_id=$1 AND ($2::varchar IS NULL OR event_id ${cmp} $2)
@@ -231,10 +239,14 @@ export function createEventsReadStorage(pool: Pool) {
         [params.runId, cursor ?? null, limit + 1],
       );
       const rows = q.rows.slice(0, limit);
+      const skipInputs = params?.resolveData === 'skip-step-inputs';
       return {
-        data: rows.map(mapEventRow),
+        data: rows.map((r0: any) => skipInputs ? mapEventRowSkipStepInputs(r0) : mapEventRow(r0)),
         cursor: rows.length ? rows[rows.length - 1].event_id : null,
         hasMore: q.rows.length > limit,
+        snapshot: snap.rows[0]
+          ? { seq: Number(snap.rows[0].seq), seqInBand: Number(snap.rows[0].seq_in_band) }
+          : undefined,
       };
     },
     async listByCorrelationId(params: any): Promise<any> {
@@ -265,4 +277,19 @@ function mapEventRow(e: any): any {
     createdAt: e.created_at,
     resumeId: e.resume_id ?? undefined,
   };
+}
+
+// `resolveData: 'skip-step-inputs'`: same mapping but strip step input from
+// step_started/step_completed event data — the event-log page does not need
+// the (potentially large) serialized inputs.
+function mapEventRowSkipStepInputs(e: any): any {
+  const base = mapEventRow(e);
+  if (
+    base.eventType === 'step_created' ||
+    base.eventType === 'step_started' ||
+    base.eventType === 'step_completed'
+  ) {
+    base.eventData = { ...base.eventData, input: undefined };
+  }
+  return base;
 }

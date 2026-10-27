@@ -1,7 +1,7 @@
 {
   "name": "@entrylite/world",
   "version": "1.0.0",
-  "description": "Entry-Lite production World for the Vercel Workflow SDK \u2014 plain node-postgres, no drizzle/graphile. Entry-Lite's own durable backend.",
+  "description": "Entry-Lite production World for the Vercel Workflow SDK — plain node-postgres, no drizzle/graphile. Entry-Lite's own durable backend.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -24,8 +24,18 @@
     "zod": "^3.25.0"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
+    "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/context-async-hooks": "^3.0.0",
     "@types/node": "^22.0.0",
-    "@types/pg": "^8.11.0"
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@opentelemetry/api": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
   }
 }
