@@ -69,6 +69,8 @@ Measured on the full runtime path (workflow@5.2.3, real HTTP delivery):
 npm run build
 node --test test/contract-conformance.test.mjs   # 5.2.3 World contract
 node --test test/e2e-world.test.mjs              # end-to-end lifecycle
+node --test test/inband-fence.test.mjs           # in-band writer fence + list snapshot + skip-step-inputs
+node --test test/hook-force-claim.test.mjs       # force-claim victim journaling + spec-version refusal
 node test/namespace-isolation.test.mjs           # cross-deployment isolation
 node --test test/                                # everything
 ```
@@ -77,7 +79,9 @@ CI runs the core suites against Postgres 18 on every push (`.github/workflows/ci
 
 ## Status / honesty
 
-**Full World-interface parity** with `@workflow/world` 5.0.5 (spec v8): 30/30 surface points present — runs/steps/hooks/events (incl. `createBatch`), streams, queue (+ `queueBatch`, `registerRoute`, `registerHandler`), `waitForTerminalStatus`/`getMany`/`cancelMany`/`experimentalSetAttributes`, full `analytics` surface, `experimental_snapshots`, `uploadDynamicWorkflowCode`, `getEncryptionKeyForRun`, `invoke` (hook-resume fast path), `getEnvironment`, deployment/telemetry hooks.
+**Full World-interface parity** with `@workflow/world` 5.0.5 (spec v8): 30/30 surface points present — runs/steps/hooks/events (incl. `createBatch`), streams, queue (+ `queueBatch`, `registerRoute`, `registerHandler`), `waitForTerminalStatus`/`getMany`/`cancelMany`/`experimentalSetAttributes`, full `analytics` surface, `experimental_snapshots`, `uploadDynamicWorkflowCode`, `getEncryptionKeyForRun`, `invoke` (hook-resume fast path), `getEnvironment`, deployment/telemetry hooks. Capabilities: `hookRetention`, `maxConcurrency`, `queueNamespace`, `hookResumeDedup`, `hookForceClaim`, `dynamicWorkflowCode`, `invoke`, `inBandFence`, `eventsResolveData`.
+
+Protocol contracts (spec 8): in-band writer fence (`expectedSeqInBand` / `InBandSupersededError` / list `snapshot {seq, seqInBand}`), `resolveData: 'skip-step-inputs'` on the event page, hook force-claim victim journaling (`hook_disposed` + `forceClaimedBy` in the victim's log) and refusal against running sub-spec-8 victims (`hook_conflict` + `forceRefusedReason: 'victim-spec-version'`), `HookConflictError` token-conflict routing, `resumeId` dedup on `hook_received`.
 
 Verified: durability (SIGKILL resume), depth (150 steps), throughput (5k runs, no namespace regression), multi-process scale, namespace isolation, crash recovery, hook resume (dedup + force-claim), invoke end-to-end. Remaining caveats: benchmarks are synthetic, not real-traffic proof; OTel export is app-side (the SDK emits spans when the app registers an OTel SDK — no world endpoint required).
 
