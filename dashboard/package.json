@@ -1,0 +1,17 @@
+{
+  "name": "@entrylite/world-dashboard",
+  "version": "0.1.0",
+  "description": "Observability dashboard for @entrylite/world",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.3.0",
+    "pg": "^8.23.1"
+  }
+}
