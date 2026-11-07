@@ -3,7 +3,7 @@
 const express = require('express');
 const path = require('path');
 const { Pool } = require('pg');
-const devalue = require('/home/agentuser/entry-agents/node_modules/.pnpm/devalue@5.9.4/node_modules/devalue');
+const devalue = require('devalue');
 
 const PORT = process.env.PORT || 3300;
 const pool = new Pool({
